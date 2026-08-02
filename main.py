@@ -12,10 +12,11 @@ def self_test() -> int:
     import matplotlib
     import numpy
     import scipy
+    import tkinterdnd2
 
     from flat_analyzer import __version__
 
-    dependencies = (astropy, customtkinter, matplotlib, numpy, scipy)
+    dependencies = (astropy, customtkinter, matplotlib, numpy, scipy, tkinterdnd2)
     if any(module is None for module in dependencies):
         raise RuntimeError("A bundled dependency could not be imported.")
 

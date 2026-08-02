@@ -8,6 +8,7 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 import matplotlib
+from tkinterdnd2 import COPY, DND_FILES, TkinterDnD
 
 matplotlib.use("TkAgg")
 
@@ -175,11 +176,33 @@ class MainWindow(ctk.CTk):
         self._placeholder.grid(row=0, column=0)
 
     def _setup_drag_drop(self) -> None:
+        # CustomTkinter owns the Tk root, so initialize TkDnD on the existing
+        # root rather than replacing it with TkinterDnD.Tk. TkDnD methods are
+        # added to descendant widgets, not to tkinter.Tk itself.
         try:
-            self.drop_target_register("DND_Files")  # type: ignore[attr-defined]
-            self.dnd_bind("<<Drop>>", self._on_drop)  # type: ignore[attr-defined]
-        except (tk.TclError, AttributeError):
-            pass
+            TkinterDnD.require(self)
+            registered = 0
+            for widget in self._iter_descendant_widgets(self):
+                if not hasattr(widget, "drop_target_register"):
+                    continue
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._on_drop)
+                registered += 1
+        except (tk.TclError, RuntimeError) as exc:
+            raise RuntimeError(
+                "Drag-and-drop initialization failed. "
+                "The bundled TkDnD library could not be loaded."
+            ) from exc
+
+        if registered == 0:
+            raise RuntimeError("Drag-and-drop could not find a Tk widget target.")
+
+    @staticmethod
+    def _iter_descendant_widgets(widget: tk.Misc):
+        """Yield a widget and all Tk descendants that can accept drops."""
+        for child in widget.winfo_children():
+            yield child
+            yield from MainWindow._iter_descendant_widgets(child)
 
     def _bind_events(self) -> None:
         self._sigma_slider.configure(command=self._on_sigma_drag)
@@ -214,10 +237,11 @@ class MainWindow(ctk.CTk):
         self._on_contour_step_drag(self._contour_step_slider.get())
         self._refresh_preview()
 
-    def _on_drop(self, event: tk.Event) -> None:
+    def _on_drop(self, event: tk.Event) -> str:
         path = self._parse_drop_paths(str(event.data))
         if path:
             self._load_path(path)
+        return COPY
 
     @staticmethod
     def _parse_drop_paths(data: str) -> Path | None:

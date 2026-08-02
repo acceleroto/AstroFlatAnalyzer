@@ -9,13 +9,14 @@ block_cipher = None
 
 ctk_datas, ctk_binaries, ctk_hidden = collect_all("customtkinter")
 astro_datas, astro_binaries, astro_hidden = collect_all("astropy")
+dnd_datas, dnd_binaries, dnd_hidden = collect_all("tkinterdnd2")
 
 a = Analysis(
     ["main.py"],
     pathex=[],
-    binaries=ctk_binaries + astro_binaries,
-    datas=ctk_datas + astro_datas,
-    hiddenimports=ctk_hidden + astro_hidden,
+    binaries=ctk_binaries + astro_binaries + dnd_binaries,
+    datas=ctk_datas + astro_datas + dnd_datas,
+    hiddenimports=ctk_hidden + astro_hidden + dnd_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

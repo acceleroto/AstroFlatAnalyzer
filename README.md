@@ -4,7 +4,7 @@ AstroFlatAnalyzer analyzes illumination falloff and vignetting in astronomy flat
 
 FITS files are processed locally. The application does not upload images or require an internet connection after installation.
 
-Current release: **0.9.0 pre-release**
+Current release: **0.9.1 pre-release**
 
 - Repository: <https://github.com/Acceleroto/AstroFlatAnalyzer>
 - Downloads: <https://github.com/Acceleroto/AstroFlatAnalyzer/releases>
@@ -21,7 +21,7 @@ Current release: **0.9.0 pre-release**
 - Secondary 25×25-region illumination summary for all four corners
 - Export PNG or JPG images
 - User-selected export width with height automatically calculated to preserve the source aspect ratio
-- Native file picker and drag-and-drop FITS loading
+- Native file picker and TkDnD-based drag-and-drop FITS loading
 
 ## Analysis behavior
 
@@ -115,7 +115,10 @@ python main.py
 4. Select PNG or JPG.
 5. Click **Save image…**.
 
-Processing occurs after a slider is released. Text fields update after pressing Enter or leaving the field.
+Drag-and-drop is provided by the bundled TkDnD extension and is configured
+automatically for source and standalone builds. Processing occurs after a
+slider is released. Text fields update after pressing Enter or leaving the
+field.
 
 ## Tests
 
@@ -129,9 +132,11 @@ The tests cover mono FITS, RGB FITS, Bayer reduction, FITS scaling keywords, ill
 
 ## Standalone builds
 
-Standalone builds bundle Python and the application dependencies. Users do not need to install Python, NumPy, SciPy, Astropy, or CustomTkinter.
+Standalone builds bundle Python, the application dependencies, and the native
+TkDnD libraries. Users do not need to install Python, NumPy, SciPy, Astropy,
+CustomTkinter, or `tkinterdnd2`.
 
-PyInstaller builds must run on the target operating system and CPU architecture. The v0.9.0 release artifacts are:
+PyInstaller builds must run on the target operating system and CPU architecture. The v0.9.1 release artifacts are:
 
 ```text
 AstroFlatAnalyzer-macOS-AppleSilicon.zip
@@ -194,7 +199,7 @@ Cross-platform builds run in GitHub Actions using these hosted runners:
 | Windows 64-bit | `windows-2025` |
 | Linux x86_64 | `ubuntu-22.04` |
 
-The workflow runs tests and a wheel smoke test before building. A manual workflow run produces downloadable test artifacts. Pushing a `v0.9.0` tag produces the four archives, a `SHA256SUMS.txt` file, and a GitHub pre-release. macOS Intel support is retained as a separate build because Apple Silicon and Intel Python dependencies cannot safely be mixed.
+The workflow runs tests and a wheel smoke test before building. A manual workflow run produces downloadable test artifacts. Pushing a `v0.9.1` tag produces the four archives, a `SHA256SUMS.txt` file, and a GitHub pre-release. macOS Intel support is retained as a separate build because Apple Silicon and Intel Python dependencies cannot safely be mixed.
 
 ## License
 

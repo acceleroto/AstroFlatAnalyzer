@@ -1,4 +1,4 @@
-# Validated release-build dependency set for AstroFlatAnalyzer 0.9.0.
+# Validated release-build dependency set for AstroFlatAnalyzer 0.9.1.
 # Regenerate after intentionally upgrading dependencies and rerun the
 # complete cross-platform acceptance suite.
 astropy==8.0.1
@@ -10,3 +10,4 @@ pillow==12.2.0
 pyinstaller==6.21.0
 pytest==9.1.1
 scipy==1.16.3
+tkinterdnd2==0.6.2

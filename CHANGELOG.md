@@ -2,6 +2,16 @@
 
 All notable changes to AstroFlatAnalyzer are documented here.
 
+## [0.9.1] - 2026-08-01
+
+Patch release for standalone drag-and-drop support.
+
+### Fixed
+
+- Enabled cross-platform drag-and-drop using the bundled TkDnD extension.
+- Added `tkinterdnd2` to source dependencies and PyInstaller data collection so
+  developers and standalone users do not need to install it separately.
+
 ## [0.9.0] - 2026-08-01
 
 Pre-release for standalone-build testing.
