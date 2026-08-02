@@ -1,0 +1,147 @@
+name: CI and Release Builds
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -c constraints-release.txt -e ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest -v
+
+      - name: Build wheel and verify package contents
+        run: |
+          python -m build --wheel
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+          assert "main.py" in names, "main.py is missing from the wheel"
+          assert any(name.endswith("flat_analyzer/__init__.py") for name in names)
+          print(f"Verified wheel: {wheel}")
+          PY
+
+  build:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    needs: tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            artifact: AstroFlatAnalyzer-macOS-AppleSilicon
+            archive: zip
+          - runner: macos-15-intel
+            artifact: AstroFlatAnalyzer-macOS-Intel
+            archive: zip
+          - runner: windows-2025
+            artifact: AstroFlatAnalyzer-Windows
+            archive: zip
+          - runner: ubuntu-22.04
+            artifact: AstroFlatAnalyzer-Linux
+            archive: tar.gz
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -c constraints-release.txt -e ".[dev]"
+
+      - name: Build with PyInstaller
+        run: python -m PyInstaller --clean --noconfirm flat_analyzer.spec
+
+      - name: Run bundled runtime self-test on macOS
+        if: runner.os == 'macOS'
+        run: dist/AstroFlatAnalyzer.app/Contents/MacOS/AstroFlatAnalyzer --self-test
+
+      - name: Run bundled runtime self-test on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\dist\AstroFlatAnalyzer\AstroFlatAnalyzer.exe --self-test
+
+      - name: Run bundled runtime self-test on Linux
+        if: runner.os == 'Linux'
+        run: dist/AstroFlatAnalyzer/AstroFlatAnalyzer --self-test
+
+      - name: Package macOS archive
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cd dist
+          zip -r "../${{ matrix.artifact }}.zip" AstroFlatAnalyzer.app
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\AstroFlatAnalyzer -DestinationPath "${{ matrix.artifact }}.zip"
+
+      - name: Package Linux archive
+        if: runner.os == 'Linux'
+        run: tar -czf "${{ matrix.artifact }}.tar.gz" -C dist AstroFlatAnalyzer
+
+      - name: Upload test-build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            *.zip
+            *.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download platform archives
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        working-directory: release-assets
+        run: sha256sum *.zip *.tar.gz > SHA256SUMS.txt
+
+      - name: Publish GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" release-assets/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "AstroFlatAnalyzer ${GITHUB_REF_NAME}" \
+            --notes-file CHANGELOG.md \
+            --prerelease

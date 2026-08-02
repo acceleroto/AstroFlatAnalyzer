@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astroflatanalyzer"
+version = "0.9.0"
+description = "Analyze vignetting profiles from astronomy flat calibration FITS frames"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Acceleroto" }]
+dependencies = [
+    "astropy>=6.0",
+    "customtkinter>=5.2",
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2",
+    "pyinstaller>=6.0",
+    "pytest>=8.0",
+]
+
+[project.scripts]
+astroflatanalyzer = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flat_analyzer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
