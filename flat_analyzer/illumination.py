@@ -338,17 +338,49 @@ def resample_for_export(
     return resampled.astype(np.float64)
 
 
+def reduce_for_preview(
+    image: np.ndarray,
+    max_dimension: int = 900,
+) -> tuple[np.ndarray, int]:
+    """Reduce an image by integer-sized finite-pixel block averaging.
+
+    The returned factor is the number of source pixels represented by each
+    preview pixel along the reduced dimensions. Edge blocks may contain fewer
+    pixels when the source dimensions are not divisible by the factor.
+    """
+    source = np.asarray(image, dtype=np.float64)
+    if source.ndim != 2:
+        raise ValueError("Preview reduction requires a two-dimensional image.")
+    if max_dimension <= 0:
+        raise ValueError("Preview maximum dimension must be positive.")
+
+    ny, nx = source.shape
+    if ny == 0 or nx == 0:
+        raise ValueError("Preview reduction requires a non-empty image.")
+
+    factor = max(1, int(np.ceil(max(ny, nx) / max_dimension)))
+    if factor == 1:
+        return source.copy(), factor
+
+    y_starts = np.arange(0, ny, factor, dtype=int)
+    x_starts = np.arange(0, nx, factor, dtype=int)
+    finite = np.isfinite(source)
+    values = np.where(finite, source, 0.0)
+
+    summed = np.add.reduceat(values, y_starts, axis=0)
+    summed = np.add.reduceat(summed, x_starts, axis=1)
+    counts = np.add.reduceat(finite.astype(np.int64), y_starts, axis=0)
+    counts = np.add.reduceat(counts, x_starts, axis=1)
+
+    reduced = np.full(summed.shape, np.nan, dtype=np.float64)
+    np.divide(summed, counts, out=reduced, where=counts > 0)
+    return reduced, factor
+
+
 def downsample_for_preview(
     illumination_pct: np.ndarray,
     max_width: int = 1200,
 ) -> np.ndarray:
     """Downsample for UI preview."""
-    ny, nx = illumination_pct.shape
-    if nx <= max_width:
-        return illumination_pct.copy()
-
-    scale = max_width / nx
-    from scipy.ndimage import zoom
-
-    filled = np.nan_to_num(illumination_pct, nan=0.0)
-    return zoom(filled, scale, order=1).astype(np.float64)
+    reduced, _ = reduce_for_preview(illumination_pct, max_dimension=max_width)
+    return reduced

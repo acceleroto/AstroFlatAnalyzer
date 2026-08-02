@@ -12,6 +12,7 @@ from flat_analyzer.illumination import (
     compute_stats,
     effective_contour_levels,
     normalize_illumination,
+    reduce_for_preview,
     resample_for_export,
     smooth_illumination,
 )
@@ -58,6 +59,68 @@ def test_smoothing_sigma_zero_unchanged():
     raw = normalize_illumination(image, ReferenceMode.CENTER)
     mapped = compute_illumination_map(image, ReferenceMode.CENTER, sigma=0)
     assert np.allclose(mapped, raw)
+
+
+def test_reduce_for_preview_uses_integer_area_averaging():
+    image = np.arange(16, dtype=float).reshape(4, 4)
+    reduced, factor = reduce_for_preview(image, max_dimension=2)
+
+    assert factor == 2
+    assert reduced.shape == (2, 2)
+    assert np.allclose(reduced, [[2.5, 4.5], [10.5, 12.5]])
+    assert np.array_equal(image, np.arange(16, dtype=float).reshape(4, 4))
+
+
+def test_reduce_for_preview_handles_odd_dimensions_and_non_finite_values():
+    image = np.arange(15, dtype=float).reshape(3, 5)
+    image[0, 0] = np.nan
+
+    reduced, factor = reduce_for_preview(image, max_dimension=2)
+
+    assert factor == 3
+    assert reduced.shape == (1, 2)
+    assert np.all(np.isfinite(reduced))
+    assert max(reduced.shape) <= 2
+
+
+def test_reduce_for_preview_keeps_small_images_at_full_size():
+    image = _make_vignetting((40, 60))
+
+    reduced, factor = reduce_for_preview(image, max_dimension=900)
+
+    assert factor == 1
+    assert reduced.shape == image.shape
+    assert reduced is not image
+    assert np.array_equal(reduced, image)
+
+
+@pytest.mark.parametrize("max_dimension", [512, 768, 900])
+def test_reduced_preview_is_close_to_full_resolution_reference(max_dimension):
+    ny, nx = 600, 1200
+    y, x = np.mgrid[0:ny, 0:nx]
+    image = _make_vignetting((ny, nx))
+    image *= 1.0 + 0.05 * np.sin(x / 12.0) * np.sin(y / 17.0)
+    sigma = 25.0
+
+    full_illumination = compute_illumination_map(
+        image, ReferenceMode.CENTER, sigma=sigma
+    )
+    reference, _ = reduce_for_preview(full_illumination, max_dimension=max_dimension)
+    preview_source, factor = reduce_for_preview(image, max_dimension=max_dimension)
+    preview = compute_illumination_map(
+        preview_source,
+        ReferenceMode.CENTER,
+        sigma=sigma / factor,
+    )
+
+    assert preview.shape == reference.shape
+    assert np.mean(np.abs(preview - reference)) < 0.1
+
+    levels = compute_contour_levels(100, 70, 5)
+    assert np.array_equal(
+        effective_contour_levels(reference, levels, 5),
+        effective_contour_levels(preview, levels, 5),
+    )
 
 
 def test_median_reference():

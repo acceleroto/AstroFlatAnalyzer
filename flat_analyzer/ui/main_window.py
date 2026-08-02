@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -25,7 +26,7 @@ from flat_analyzer.illumination import (
     compute_export_dimensions,
     compute_illumination_map,
     compute_stats,
-    downsample_for_preview,
+    reduce_for_preview,
     resample_for_export,
 )
 from flat_analyzer.visualization import (
@@ -39,6 +40,9 @@ FITS_FILETYPES = [
     ("FITS files", "*.fits *.fit *.fts"),
     ("All files", "*.*"),
 ]
+
+SLIDER_PREVIEW_DELAY_MS = 1000
+PREVIEW_MAX_DIMENSION = 900
 
 
 class MainWindow(ctk.CTk):
@@ -58,6 +62,9 @@ class MainWindow(ctk.CTk):
         self._corner_falloff: CornerFalloffStats | None = None
         self._canvas: FigureCanvasTkAgg | None = None
         self._last_valid_export_width: int = 0
+        self._pending_preview_after: str | None = None
+        self._preview_image: np.ndarray | None = None
+        self._preview_reduction_factor = 1
 
         self._build_layout()
         self._setup_drag_drop()
@@ -84,8 +91,12 @@ class MainWindow(ctk.CTk):
         self._sigma_slider = ctk.CTkSlider(panel, from_=25, to=200, number_of_steps=175)
         self._sigma_slider.set(100)
         self._sigma_slider.pack(fill="x", padx=8, pady=(0, 2))
-        self._sigma_label = ctk.CTkLabel(panel, text="100.0 px")
-        self._sigma_label.pack(anchor="w", padx=8, pady=(0, 8))
+        sigma_value_frame = ctk.CTkFrame(panel, fg_color="transparent")
+        sigma_value_frame.pack(fill="x", padx=8, pady=(0, 8))
+        self._sigma_entry = ctk.CTkEntry(sigma_value_frame, width=80)
+        self._sigma_entry.insert(0, "100.0")
+        self._sigma_entry.pack(side="left")
+        ctk.CTkLabel(sigma_value_frame, text="px").pack(side="left", padx=(4, 0))
 
         ctk.CTkLabel(panel, text="Display range (%)").pack(anchor="w", padx=8)
         range_frame = ctk.CTkFrame(panel, fg_color="transparent")
@@ -105,8 +116,14 @@ class MainWindow(ctk.CTk):
         self._contour_step_slider = ctk.CTkSlider(panel, from_=1, to=10, number_of_steps=9)
         self._contour_step_slider.set(2)
         self._contour_step_slider.pack(fill="x", padx=8, pady=(0, 2))
-        self._contour_step_label = ctk.CTkLabel(panel, text="2%")
-        self._contour_step_label.pack(anchor="w", padx=8, pady=(0, 8))
+        contour_step_value_frame = ctk.CTkFrame(panel, fg_color="transparent")
+        contour_step_value_frame.pack(fill="x", padx=8, pady=(0, 8))
+        self._contour_step_entry = ctk.CTkEntry(contour_step_value_frame, width=80)
+        self._contour_step_entry.insert(0, "2")
+        self._contour_step_entry.pack(side="left")
+        ctk.CTkLabel(contour_step_value_frame, text="%").pack(
+            side="left", padx=(4, 0)
+        )
 
         ctk.CTkLabel(panel, text="Export resolution").pack(anchor="w", padx=8)
         self._preset_var = ctk.StringVar(value="Native")
@@ -143,7 +160,17 @@ class MainWindow(ctk.CTk):
             self._jpg_quality_frame, from_=85, to=100, number_of_steps=15
         )
         self._jpg_quality_slider.set(95)
-        self._jpg_quality_slider.pack(fill="x", pady=(0, 8))
+        self._jpg_quality_slider.pack(fill="x", pady=(0, 2))
+        jpg_quality_value_frame = ctk.CTkFrame(
+            self._jpg_quality_frame, fg_color="transparent"
+        )
+        jpg_quality_value_frame.pack(fill="x", pady=(0, 8))
+        self._jpg_quality_entry = ctk.CTkEntry(jpg_quality_value_frame, width=80)
+        self._jpg_quality_entry.insert(0, "95")
+        self._jpg_quality_entry.pack(side="left")
+        ctk.CTkLabel(jpg_quality_value_frame, text="%").pack(
+            side="left", padx=(4, 0)
+        )
 
         ctk.CTkButton(panel, text="Save image…", command=self._save_image).pack(
             fill="x", padx=8, pady=(12, 8)
@@ -209,8 +236,17 @@ class MainWindow(ctk.CTk):
         self._sigma_slider.bind("<ButtonRelease-1>", self._on_slider_release)
         self._contour_step_slider.configure(command=self._on_contour_step_drag)
         self._contour_step_slider.bind("<ButtonRelease-1>", self._on_slider_release)
+        self._jpg_quality_slider.configure(command=self._on_jpg_quality_drag)
         self._contour_check.configure(command=lambda _: self._refresh_preview())
         self._format_menu.configure(command=self._on_format_change)
+
+        for widget, handler in (
+            (self._sigma_entry, self._on_sigma_entry_change),
+            (self._contour_step_entry, self._on_contour_step_entry_change),
+            (self._jpg_quality_entry, self._on_jpg_quality_entry_change),
+        ):
+            widget.bind("<Return>", handler)
+            widget.bind("<FocusOut>", handler)
 
         for widget in (self._vmin_entry, self._vmax_entry):
             widget.bind("<Return>", lambda _: self._refresh_preview())
@@ -225,17 +261,105 @@ class MainWindow(ctk.CTk):
         else:
             self._jpg_quality_frame.pack_forget()
 
+    @staticmethod
+    def _set_entry_value(entry: ctk.CTkEntry, value: str) -> None:
+        if entry.get() == value:
+            return
+        entry.delete(0, "end")
+        entry.insert(0, value)
+
+    @staticmethod
+    def _parse_slider_value(
+        raw_value: str, minimum: float, maximum: float
+    ) -> float | None:
+        try:
+            value = float(raw_value)
+        except ValueError:
+            return None
+        if not math.isfinite(value):
+            return None
+        value = float(round(value))
+        return min(max(value, minimum), maximum)
+
+    def _update_sigma_value(self, value: float) -> None:
+        self._set_entry_value(self._sigma_entry, f"{value:.1f}")
+
+    def _update_contour_step_value(self, value: float) -> None:
+        self._set_entry_value(self._contour_step_entry, f"{int(value)}")
+
+    def _update_jpg_quality_value(self, value: float) -> None:
+        self._set_entry_value(self._jpg_quality_entry, f"{int(value)}")
+
     def _on_sigma_drag(self, value: float) -> None:
-        self._sigma_label.configure(text=f"{value:.1f} px")
+        self._update_sigma_value(value)
+        self._schedule_preview_refresh()
 
     def _on_contour_step_drag(self, value: float) -> None:
-        self._contour_step_label.configure(text=f"{int(value)}%")
+        self._update_contour_step_value(value)
+        self._schedule_preview_refresh()
+
+    def _on_jpg_quality_drag(self, value: float) -> None:
+        self._update_jpg_quality_value(value)
 
     def _on_slider_release(self, _event: tk.Event | None = None) -> None:
-        """Recompute preview after the user releases a slider."""
-        self._on_sigma_drag(self._sigma_slider.get())
-        self._on_contour_step_drag(self._contour_step_slider.get())
+        """Recompute the preview immediately after a slider is released."""
+        self._cancel_scheduled_preview()
+        self._update_sigma_value(self._sigma_slider.get())
+        self._update_contour_step_value(self._contour_step_slider.get())
         self._refresh_preview()
+
+    def _schedule_preview_refresh(self) -> None:
+        self._cancel_scheduled_preview()
+        self._pending_preview_after = self.after(
+            SLIDER_PREVIEW_DELAY_MS, self._run_scheduled_preview_refresh
+        )
+
+    def _cancel_scheduled_preview(self) -> None:
+        if self._pending_preview_after is None:
+            return
+        try:
+            self.after_cancel(self._pending_preview_after)
+        except tk.TclError:
+            pass
+        self._pending_preview_after = None
+
+    def _run_scheduled_preview_refresh(self) -> None:
+        self._pending_preview_after = None
+        self._refresh_preview()
+
+    def _on_sigma_entry_change(self, _event=None) -> None:
+        value = self._parse_slider_value(
+            self._sigma_entry.get(), minimum=25, maximum=200
+        )
+        if value is None:
+            self._update_sigma_value(self._sigma_slider.get())
+            return
+        self._sigma_slider.set(value)
+        self._update_sigma_value(self._sigma_slider.get())
+        self._cancel_scheduled_preview()
+        self._refresh_preview()
+
+    def _on_contour_step_entry_change(self, _event=None) -> None:
+        value = self._parse_slider_value(
+            self._contour_step_entry.get(), minimum=1, maximum=10
+        )
+        if value is None:
+            self._update_contour_step_value(self._contour_step_slider.get())
+            return
+        self._contour_step_slider.set(value)
+        self._update_contour_step_value(self._contour_step_slider.get())
+        self._cancel_scheduled_preview()
+        self._refresh_preview()
+
+    def _on_jpg_quality_entry_change(self, _event=None) -> None:
+        value = self._parse_slider_value(
+            self._jpg_quality_entry.get(), minimum=85, maximum=100
+        )
+        if value is None:
+            self._update_jpg_quality_value(self._jpg_quality_slider.get())
+            return
+        self._jpg_quality_slider.set(value)
+        self._update_jpg_quality_value(self._jpg_quality_slider.get())
 
     def _on_drop(self, event: tk.Event) -> str:
         path = self._parse_drop_paths(str(event.data))
@@ -288,6 +412,9 @@ class MainWindow(ctk.CTk):
             self._corner_falloff = compute_corner_falloff(loaded.image)
         except ValueError:
             self._corner_falloff = None
+        self._preview_image, self._preview_reduction_factor = reduce_for_preview(
+            loaded.image, max_dimension=PREVIEW_MAX_DIMENSION
+        )
         self._path_label.configure(text=str(loaded.metadata.path.name))
         self._last_valid_export_width = loaded.metadata.nx
         self._export_width_entry.delete(0, "end")
@@ -318,7 +445,11 @@ class MainWindow(ctk.CTk):
             reference_label="center",
         )
 
-    def _compute_illumination(self) -> np.ndarray | None:
+    def _compute_illumination(
+        self,
+        image: np.ndarray | None = None,
+        sigma_scale: float = 1.0,
+    ) -> np.ndarray | None:
         if self._loaded is None:
             return None
         settings = self._get_render_settings()
@@ -326,15 +457,16 @@ class MainWindow(ctk.CTk):
             return None
 
         try:
+            source = self._loaded.image if image is None else image
             sigma = self._sigma_slider.get()
             if self._loaded.metadata.bayer_reduced:
                 # Slider is expressed in original sensor pixels; the Bayer
                 # analysis image is half-size in each dimension.
                 sigma /= 2.0
             return compute_illumination_map(
-                self._loaded.image,
+                source,
                 mode=ReferenceMode.CENTER,
-                sigma=sigma,
+                sigma=sigma * sigma_scale,
             )
         except ValueError:
             return None
@@ -343,7 +475,15 @@ class MainWindow(ctk.CTk):
         if self._loaded is None:
             return
 
-        illumination = self._compute_illumination()
+        if self._preview_image is None:
+            self._preview_image, self._preview_reduction_factor = reduce_for_preview(
+                self._loaded.image, max_dimension=PREVIEW_MAX_DIMENSION
+            )
+
+        illumination = self._compute_illumination(
+            self._preview_image,
+            sigma_scale=1.0 / self._preview_reduction_factor,
+        )
         settings = self._get_render_settings()
         if illumination is None or settings is None:
             return
@@ -354,10 +494,9 @@ class MainWindow(ctk.CTk):
             return
 
         self._update_stats(stats, self._corner_falloff)
-        preview_data = downsample_for_preview(illumination)
 
         try:
-            fig = build_preview_figure(preview_data, settings)
+            fig = build_preview_figure(illumination, settings)
         except Exception as exc:
             messagebox.showerror("Preview error", str(exc))
             return

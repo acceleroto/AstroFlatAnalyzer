@@ -7,7 +7,7 @@ from main import self_test
 
 
 def test_release_version():
-    assert __version__ == "0.9.2"
+    assert __version__ == "0.9.3"
 
 
 def test_license_exists():

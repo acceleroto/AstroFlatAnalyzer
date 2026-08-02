@@ -5,7 +5,7 @@ AstroFlatAnalyzer analyzes illumination falloff and vignetting in astronomy flat
 
 FITS files are processed locally. The application does not upload images or require an internet connection after installation.
 
-Current release: **0.9.2 pre-release**
+Current release: **0.9.3 pre-release**
 
 - Repository: <https://github.com/Acceleroto/AstroFlatAnalyzer>
 - Downloads: <https://github.com/Acceleroto/AstroFlatAnalyzer/releases>
@@ -53,6 +53,15 @@ The default controls are:
 - Contour minimum: internally set to 0%; levels outside the actual data range are omitted
 
 For Bayer-reduced files, the smoothing value is expressed in original sensor pixels and converted internally to analysis-image pixels.
+
+### Preview and export resolution
+
+Interactive previews use an anti-aliased, integer-factor reduction of the
+analysis image, capped at a 900-pixel long edge. Smoothing is scaled to the
+reduced pixel grid, which keeps slider recalculation responsive while staying
+close to the full-resolution result. The 25×25 corner and center summary
+continues to use the full analysis image. Image exports always recalculate
+from the full analysis image and use the requested output dimensions.
 
 ### Corner illumination summary
 
@@ -118,9 +127,11 @@ python main.py
 5. Click **Save image…**.
 
 Drag-and-drop is provided by the bundled TkDnD extension and is configured
-automatically for source and standalone builds. Processing occurs after a
-slider is released. Text fields update after pressing Enter or leaving the
-field.
+automatically for source and standalone builds. Slider values can be entered
+directly, and the value fields stay synchronized with slider movement.
+Smoothing and contour processing begins after the slider has been stationary
+for one second, or immediately when the user releases it. Text fields commit
+their values after pressing Enter or leaving the field.
 
 ## Tests
 
@@ -138,7 +149,7 @@ Standalone builds bundle Python, the application dependencies, and the native
 TkDnD libraries. Users do not need to install Python, NumPy, SciPy, Astropy,
 CustomTkinter, or `tkinterdnd2`.
 
-PyInstaller builds must run on the target operating system and CPU architecture. The v0.9.2 release artifacts are:
+PyInstaller builds must run on the target operating system and CPU architecture. The v0.9.3 release artifacts are:
 
 ```text
 AstroFlatAnalyzer-macOS-AppleSilicon.zip
@@ -201,7 +212,7 @@ Cross-platform builds run in GitHub Actions using these hosted runners:
 | Windows 64-bit | `windows-2025` |
 | Linux x86_64 | `ubuntu-22.04` |
 
-The workflow runs tests and a wheel smoke test before building. A manual workflow run produces downloadable test artifacts. Pushing a `v0.9.2` tag produces the four archives, a `SHA256SUMS.txt` file, and a GitHub pre-release. macOS Intel support is retained as a separate build because Apple Silicon and Intel Python dependencies cannot safely be mixed.
+The workflow runs tests and a wheel smoke test before building. A manual workflow run produces downloadable test artifacts. Pushing a `v0.9.3` tag produces the four archives, a `SHA256SUMS.txt` file, and a GitHub pre-release. macOS Intel support is retained as a separate build because Apple Silicon and Intel Python dependencies cannot safely be mixed.
 
 ## License
 

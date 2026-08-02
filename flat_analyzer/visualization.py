@@ -162,12 +162,13 @@ def build_preview_figure(
     illumination_pct: np.ndarray,
     settings: RenderSettings,
     max_width_px: int = 900,
+    max_height_px: int = 700,
 ) -> Figure:
     """Build a preview-sized figure for embedding in the UI."""
     ny, nx = illumination_pct.shape
-    aspect = nx / ny
-    width_in = max_width_px / EXPORT_DPI
-    height_in = width_in / aspect
+    scale = min(max_width_px / nx, max_height_px / ny)
+    width_in = (nx * scale) / EXPORT_DPI
+    height_in = (ny * scale) / EXPORT_DPI
     return build_figure(
         illumination_pct,
         settings,

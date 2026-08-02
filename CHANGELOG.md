@@ -2,6 +2,19 @@
 
 All notable changes to AstroFlatAnalyzer are documented here.
 
+## [0.9.3] - 2026-08-02
+
+Enhancement release for responsive controls and preview rendering.
+
+### Added
+
+- Synchronized numeric inputs for the smoothing, contour-step, and JPG-quality
+  sliders.
+- Debounced preview recalculation while sliders are moving, with immediate
+  refresh on release.
+- Integer-factor, anti-aliased preview reduction while preserving
+  full-resolution exports and corner-region analysis.
+
 ## [0.9.2] - 2026-08-01
 
 Patch release adding application branding.
