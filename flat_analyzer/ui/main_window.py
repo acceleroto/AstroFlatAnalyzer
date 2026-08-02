@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
+from dataclasses import dataclass
+from functools import partial
 import math
+import os
+from queue import Empty, Queue
 import tkinter as tk
 from pathlib import Path
+import tempfile
 from tkinter import filedialog, messagebox
+from typing import Any
 
 import customtkinter as ctk
 import matplotlib
@@ -20,19 +27,23 @@ from matplotlib.figure import Figure
 from flat_analyzer.fits_loader import FitsLoadError, LoadedFlat, load_flat
 from flat_analyzer.illumination import (
     CornerFalloffStats,
-    ReferenceMode,
     compute_contour_levels,
     compute_corner_falloff,
     compute_export_dimensions,
-    compute_illumination_map,
-    compute_stats,
     reduce_for_preview,
     resample_for_export,
+)
+from flat_analyzer.processing import (
+    PreviewResult,
+    compute_export_result,
+    compute_preview_result,
+    preview_worker_capacity,
 )
 from flat_analyzer.visualization import (
     RenderSettings,
     build_export_figure,
     build_preview_figure,
+    MATPLOTLIB_RENDER_LOCK,
     save_figure,
 )
 
@@ -42,7 +53,142 @@ FITS_FILETYPES = [
 ]
 
 SLIDER_PREVIEW_DELAY_MS = 1000
-PREVIEW_MAX_DIMENSION = 900
+PREVIEW_MAX_DIMENSION = 1200
+WORKER_POLL_INTERVAL_MS = 50
+
+
+@dataclass(frozen=True)
+class _PreviewRequest:
+    """Snapshot of a preview computation request."""
+
+    request_id: int
+    generation: int
+    key: tuple[int, float]
+    image: np.ndarray
+    sigma: float
+
+
+@dataclass(frozen=True)
+class _ExportRequest:
+    """Snapshot of an export computation request."""
+
+    generation: int
+    key: tuple[int, float]
+    image: np.ndarray
+    sigma: float
+    export_width: int
+    export_height: int
+    path: str
+    fmt: str
+    jpg_quality: int
+    settings: RenderSettings
+
+
+@dataclass(frozen=True)
+class _ExportJobResult:
+    """Worker result containing a staged file and optional new map cache."""
+
+    illumination: np.ndarray | None
+    temporary_path: str
+
+
+class _ExportJobError(Exception):
+    """Export failure that can preserve a newly computed map cache."""
+
+    def __init__(
+        self,
+        cause: Exception,
+        illumination: np.ndarray | None,
+        temporary_path: str,
+    ) -> None:
+        self.cause = cause
+        self.illumination = illumination
+        self.temporary_path = temporary_path
+        super().__init__(str(cause))
+
+
+def _remove_export_file(path: str | Path | None) -> None:
+    """Best-effort cleanup for a staged export file."""
+    if path is None:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _create_export_temp_path(path: str | Path) -> Path:
+    """Create a closed temporary sibling path for atomic final replacement."""
+    final_path = Path(path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{final_path.name}.",
+        suffix=final_path.suffix,
+        dir=final_path.parent,
+    )
+    os.close(descriptor)
+    return Path(temporary_name)
+
+
+def _run_export_job(
+    image: np.ndarray | None,
+    sigma: float | None,
+    export_width: int,
+    export_height: int,
+    settings: RenderSettings,
+    temporary_path: str,
+    fmt: str,
+    jpg_quality: int,
+    cached_illumination: np.ndarray | None,
+    filter_executor: Executor | None,
+) -> _ExportJobResult:
+    """Prepare, render, and stage an export without touching Tk."""
+    illumination_to_cache: np.ndarray | None = None
+    try:
+        if cached_illumination is None:
+            if image is None or sigma is None:
+                raise ValueError("An uncached export requires an image and sigma.")
+            computed = compute_export_result(
+                image,
+                sigma,
+                export_width,
+                export_height,
+                worker_count=preview_worker_capacity(),
+                executor=filter_executor,
+            )
+            illumination_to_cache = computed.illumination
+            export_data = computed.export_data
+        else:
+            export_data = resample_for_export(
+                cached_illumination,
+                export_width,
+                export_height,
+            )
+
+        with MATPLOTLIB_RENDER_LOCK:
+            figure = build_export_figure(
+                export_data,
+                settings,
+                export_width,
+                export_height,
+            )
+            save_figure(
+                figure,
+                temporary_path,
+                fmt=fmt,
+                jpg_quality=jpg_quality,
+            )
+    except Exception as exc:
+        _remove_export_file(temporary_path)
+        raise _ExportJobError(
+            exc,
+            illumination_to_cache,
+            temporary_path,
+        ) from exc
+
+    return _ExportJobResult(
+        illumination=illumination_to_cache,
+        temporary_path=temporary_path,
+    )
 
 
 class MainWindow(ctk.CTk):
@@ -65,11 +211,38 @@ class MainWindow(ctk.CTk):
         self._pending_preview_after: str | None = None
         self._preview_image: np.ndarray | None = None
         self._preview_reduction_factor = 1
+        self._image_generation = 0
+        self._preview_cache: dict[tuple[int, float], PreviewResult] = {}
+        self._full_illumination_cache_key: tuple[int, float] | None = None
+        self._full_illumination_cache: np.ndarray | None = None
+        self._preview_request_id = 0
+        self._latest_preview_request_id = 0
+        self._preview_pending_request: _PreviewRequest | None = None
+        self._preview_inflight_request: _PreviewRequest | None = None
+        self._preview_future: Future[Any] | None = None
+        self._export_request: _ExportRequest | None = None
+        self._export_future: Future[Any] | None = None
+        self._export_temp_path: Path | None = None
+        self._worker_results: Queue[tuple[str, Future[Any]]] = Queue()
+        self._worker_poll_after: str | None = None
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="analysis"
+        )
+        self._preview_filter_executor = ThreadPoolExecutor(
+            max_workers=preview_worker_capacity(),
+            thread_name_prefix="preview-filter",
+        )
+        self._progress_window: ctk.CTkToplevel | None = None
+        self._progress_label: ctk.CTkLabel | None = None
+        self._progress_bar: ctk.CTkProgressBar | None = None
+        self._closing = False
 
         self._build_layout()
         self._setup_drag_drop()
         self._bind_events()
         self._update_export_height_label()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._schedule_worker_poll()
 
     def _build_layout(self) -> None:
         self.grid_columnconfigure(1, weight=1)
@@ -237,7 +410,7 @@ class MainWindow(ctk.CTk):
         self._contour_step_slider.configure(command=self._on_contour_step_drag)
         self._contour_step_slider.bind("<ButtonRelease-1>", self._on_slider_release)
         self._jpg_quality_slider.configure(command=self._on_jpg_quality_drag)
-        self._contour_check.configure(command=lambda _: self._refresh_preview())
+        self._contour_check.configure(command=self._on_display_setting_change)
         self._format_menu.configure(command=self._on_format_change)
 
         for widget, handler in (
@@ -249,8 +422,8 @@ class MainWindow(ctk.CTk):
             widget.bind("<FocusOut>", handler)
 
         for widget in (self._vmin_entry, self._vmax_entry):
-            widget.bind("<Return>", lambda _: self._refresh_preview())
-            widget.bind("<FocusOut>", lambda _: self._refresh_preview())
+            widget.bind("<Return>", self._on_display_setting_change)
+            widget.bind("<FocusOut>", self._on_display_setting_change)
 
         self._export_width_entry.bind("<Return>", self._on_export_width_change)
         self._export_width_entry.bind("<FocusOut>", self._on_export_width_change)
@@ -260,6 +433,9 @@ class MainWindow(ctk.CTk):
             self._jpg_quality_frame.pack(fill="x", padx=8, pady=(0, 8))
         else:
             self._jpg_quality_frame.pack_forget()
+
+    def _on_display_setting_change(self, _event=None) -> None:
+        self._refresh_preview()
 
     @staticmethod
     def _set_entry_value(entry: ctk.CTkEntry, value: str) -> None:
@@ -407,6 +583,16 @@ class MainWindow(ctk.CTk):
             messagebox.showerror("Load error", f"Unexpected error:\n{exc}")
             return
 
+        self._image_generation += 1
+        self._cancel_scheduled_preview()
+        self._preview_pending_request = None
+        self._preview_cache.clear()
+        self._full_illumination_cache_key = None
+        self._full_illumination_cache = None
+        if self._export_request is not None:
+            self._close_progress()
+        self._cleanup_export_temp_path()
+        self._export_request = None
         self._loaded = loaded
         try:
             self._corner_falloff = compute_corner_falloff(loaded.image)
@@ -445,63 +631,165 @@ class MainWindow(ctk.CTk):
             reference_label="center",
         )
 
-    def _compute_illumination(
-        self,
-        image: np.ndarray | None = None,
-        sigma_scale: float = 1.0,
-    ) -> np.ndarray | None:
-        if self._loaded is None:
-            return None
-        settings = self._get_render_settings()
-        if settings is None:
-            return None
-
-        try:
-            source = self._loaded.image if image is None else image
-            sigma = self._sigma_slider.get()
-            if self._loaded.metadata.bayer_reduced:
-                # Slider is expressed in original sensor pixels; the Bayer
-                # analysis image is half-size in each dimension.
-                sigma /= 2.0
-            return compute_illumination_map(
-                source,
-                mode=ReferenceMode.CENTER,
-                sigma=sigma * sigma_scale,
-            )
-        except ValueError:
-            return None
+    def _get_analysis_sigma(self) -> float:
+        """Return the smoothing sigma in analysis-image pixels."""
+        sigma = float(self._sigma_slider.get())
+        if self._loaded is not None and self._loaded.metadata.bayer_reduced:
+            # Slider is expressed in original sensor pixels; the Bayer
+            # analysis image is half-sized in each dimension.
+            sigma /= 2.0
+        return sigma
 
     def _refresh_preview(self) -> None:
-        if self._loaded is None:
+        """Request a preview refresh without blocking the Tk event loop."""
+        if self._loaded is None or self._closing:
             return
 
+        settings = self._get_render_settings()
+        if settings is None:
+            return
         if self._preview_image is None:
             self._preview_image, self._preview_reduction_factor = reduce_for_preview(
                 self._loaded.image, max_dimension=PREVIEW_MAX_DIMENSION
             )
 
-        illumination = self._compute_illumination(
-            self._preview_image,
-            sigma_scale=1.0 / self._preview_reduction_factor,
+        sigma = self._get_analysis_sigma() / self._preview_reduction_factor
+        key = (self._image_generation, float(self._sigma_slider.get()))
+        self._preview_request_id += 1
+        self._latest_preview_request_id = self._preview_request_id
+
+        cached = self._preview_cache.get(key)
+        if cached is not None:
+            self._preview_pending_request = None
+            self._render_preview(cached, settings)
+            return
+
+        self._preview_pending_request = _PreviewRequest(
+            request_id=self._preview_request_id,
+            generation=self._image_generation,
+            key=key,
+            image=self._preview_image,
+            sigma=sigma,
         )
-        settings = self._get_render_settings()
-        if illumination is None or settings is None:
-            return
+        self._submit_pending_preview()
+
+    def _render_preview(
+        self,
+        result: PreviewResult,
+        settings: RenderSettings,
+    ) -> None:
+        self._update_stats(result.stats, self._corner_falloff)
 
         try:
-            stats = compute_stats(illumination)
-        except ValueError:
-            return
-
-        self._update_stats(stats, self._corner_falloff)
-
-        try:
-            fig = build_preview_figure(illumination, settings)
+            with MATPLOTLIB_RENDER_LOCK:
+                fig = build_preview_figure(result.illumination, settings)
+                self._show_figure(fig)
         except Exception as exc:
             messagebox.showerror("Preview error", str(exc))
+
+    def _submit_pending_preview(self) -> None:
+        if self._closing or self._preview_pending_request is None:
             return
 
-        self._show_figure(fig)
+        request = self._preview_pending_request
+        cached = self._preview_cache.get(request.key)
+        if cached is not None:
+            self._preview_pending_request = None
+            if request.request_id == self._latest_preview_request_id:
+                settings = self._get_render_settings()
+                if settings is not None:
+                    self._render_preview(cached, settings)
+            return
+
+        if self._preview_future is not None:
+            return
+
+        self._preview_pending_request = None
+        self._preview_inflight_request = request
+        filter_executor = self.__dict__.get("_preview_filter_executor")
+        preview_task = partial(
+            compute_preview_result,
+            request.image,
+            request.sigma,
+            executor=filter_executor,
+        )
+        future = self._executor.submit(
+            preview_task,
+        )
+        self._preview_future = future
+        self._track_worker_future("preview", future)
+
+    def _track_worker_future(self, kind: str, future: Future[Any]) -> None:
+        def handle_completion(completed: Future[Any]) -> None:
+            if kind == "export" and self.__dict__.get("_closing", False):
+                self._cleanup_export_future(completed)
+            self._worker_results.put((kind, completed))
+
+        future.add_done_callback(
+            handle_completion
+        )
+
+    def _schedule_worker_poll(self) -> None:
+        if self._closing or self._worker_poll_after is not None:
+            return
+        self._worker_poll_after = self.after(
+            WORKER_POLL_INTERVAL_MS, self._poll_worker_results
+        )
+
+    def _poll_worker_results(self) -> None:
+        self._worker_poll_after = None
+        if self._closing:
+            return
+
+        while True:
+            try:
+                kind, future = self._worker_results.get_nowait()
+            except Empty:
+                break
+            if kind == "preview":
+                self._handle_preview_result(future)
+            elif kind == "export":
+                self._handle_export_result(future)
+
+        self._schedule_worker_poll()
+
+    def _handle_preview_result(self, future: Future[Any]) -> None:
+        request = self._preview_inflight_request
+        self._preview_inflight_request = None
+        self._preview_future = None
+        if request is None:
+            self._submit_pending_preview()
+            return
+
+        try:
+            result = future.result()
+        except Exception as exc:
+            if (
+                request.generation == self._image_generation
+                and request.request_id == self._latest_preview_request_id
+            ):
+                messagebox.showerror("Preview error", str(exc))
+        else:
+            if not isinstance(result, PreviewResult):
+                if (
+                    request.generation == self._image_generation
+                    and request.request_id == self._latest_preview_request_id
+                ):
+                    messagebox.showerror(
+                        "Preview error",
+                        "Preview worker returned an invalid result.",
+                    )
+            elif request.generation == self._image_generation:
+                self._preview_cache[request.key] = result
+                while len(self._preview_cache) > 2:
+                    self._preview_cache.pop(next(iter(self._preview_cache)))
+
+                if request.request_id == self._latest_preview_request_id:
+                    settings = self._get_render_settings()
+                    if settings is not None:
+                        self._render_preview(result, settings)
+
+        self._submit_pending_preview()
 
     def _update_stats(
         self,
@@ -545,13 +833,27 @@ class MainWindow(ctk.CTk):
         if self._placeholder.winfo_ismapped():
             self._placeholder.grid_forget()
 
-        if self._canvas is not None:
-            self._canvas.get_tk_widget().destroy()
-            self._canvas = None
+        if self._canvas is None:
+            self._canvas = FigureCanvasTkAgg(fig, master=self._preview_frame)
+            widget = self._canvas.get_tk_widget()
+            widget.grid(row=0, column=0, sticky="nsew")
+            self._preview_frame.update_idletasks()
+        else:
+            old_figure = self._canvas.figure
+            old_figure.clear()
+            old_figure.set_canvas(None)
+            self._canvas.figure = fig
+            fig.set_canvas(self._canvas)
 
-        self._canvas = FigureCanvasTkAgg(fig, master=self._preview_frame)
         widget = self._canvas.get_tk_widget()
-        widget.grid(row=0, column=0, sticky="nsew")
+        width = widget.winfo_width()
+        height = widget.winfo_height()
+        if width > 1 and height > 1:
+            fig.set_size_inches(
+                width / fig.dpi,
+                height / fig.dpi,
+                forward=False,
+            )
         self._canvas.draw()
 
     def _get_export_dimensions(self) -> tuple[int, int] | None:
@@ -617,21 +919,39 @@ class MainWindow(ctk.CTk):
         self._last_valid_export_width = width
         self._update_export_height_label()
 
+    def _cleanup_export_temp_path(self) -> None:
+        """Remove the currently tracked staged export, if any."""
+        temporary_path = self.__dict__.get("_export_temp_path")
+        _remove_export_file(temporary_path)
+        self.__dict__["_export_temp_path"] = None
+
+    @staticmethod
+    def _cleanup_export_future(future: Future[Any]) -> None:
+        """Remove a staged file from a completed or failed export future."""
+        try:
+            result = future.result()
+        except _ExportJobError as exc:
+            _remove_export_file(exc.temporary_path)
+        except Exception:
+            return
+        else:
+            if isinstance(result, _ExportJobResult):
+                _remove_export_file(result.temporary_path)
+
     def _save_image(self) -> None:
         if self._loaded is None:
             messagebox.showwarning("Save", "Load a FITS file first.")
             return
+        if self._export_request is not None or self._export_future is not None:
+            messagebox.showinfo("Save", "An image export is already in progress.")
+            return
 
-        illumination = self._compute_illumination()
         settings = self._get_render_settings()
         dims = self._get_export_dimensions()
 
-        if illumination is None or settings is None or dims is None:
+        if settings is None or dims is None:
             messagebox.showerror("Save", "Invalid display or export settings.")
             return
-
-        export_w, export_h = dims
-        export_data = resample_for_export(illumination, export_w, export_h)
 
         fmt = self._format_var.get()
         ext = ".jpg" if fmt == "JPG" else ".png"
@@ -649,17 +969,189 @@ class MainWindow(ctk.CTk):
         if not path:
             return
 
+        export_w, export_h = dims
         try:
-            fig = build_export_figure(export_data, settings, export_w, export_h)
-            save_figure(
-                fig,
-                path,
-                fmt=fmt.lower(),
-                jpg_quality=int(self._jpg_quality_slider.get()),
-            )
-        except Exception as exc:
+            temporary_path = _create_export_temp_path(path)
+        except OSError as exc:
             messagebox.showerror("Save error", str(exc))
             return
+
+        request = _ExportRequest(
+            generation=self._image_generation,
+            key=(self._image_generation, float(self._sigma_slider.get())),
+            image=self._loaded.image,
+            sigma=self._get_analysis_sigma(),
+            export_width=export_w,
+            export_height=export_h,
+            path=path,
+            fmt=fmt.lower(),
+            jpg_quality=int(self._jpg_quality_slider.get()),
+            settings=settings,
+        )
+        self._export_request = request
+        self._export_temp_path = temporary_path
+        cached = (
+            self._full_illumination_cache
+            if self._full_illumination_cache_key == request.key
+            else None
+        )
+        self._show_progress(
+            "Rendering and saving image…" if cached is not None else "Preparing image…"
+        )
+        filter_executor = self.__dict__.get("_preview_filter_executor")
+        export_task = partial(
+            _run_export_job,
+            request.image if cached is None else None,
+            request.sigma if cached is None else None,
+            request.export_width,
+            request.export_height,
+            request.settings,
+            str(temporary_path),
+            request.fmt,
+            request.jpg_quality,
+            cached,
+            filter_executor,
+        )
+        try:
+            future = self._executor.submit(export_task)
+        except Exception as exc:
+            self._cleanup_export_temp_path()
+            self._show_save_error(exc)
+            return
+
+        self._export_future = future
+        self._track_worker_future("export", future)
+
+    def _handle_export_result(self, future: Future[Any]) -> None:
+        request = self._export_request
+        self._export_future = None
+        if request is None:
+            self._cleanup_export_future(future)
+            return
+
+        try:
+            result = future.result()
+        except _ExportJobError as exc:
+            if request.generation != self._image_generation:
+                self._cleanup_export_temp_path()
+                self._close_progress()
+                self._export_request = None
+                return
+            if exc.illumination is not None:
+                self._full_illumination_cache_key = request.key
+                self._full_illumination_cache = exc.illumination
+            self._show_save_error(exc.cause)
+            return
+        except Exception as exc:
+            if request.generation != self._image_generation:
+                self._cleanup_export_temp_path()
+                self._close_progress()
+                self._export_request = None
+                return
+            self._show_save_error(exc)
+            return
+
+        if request.generation != self._image_generation:
+            if isinstance(result, _ExportJobResult):
+                _remove_export_file(result.temporary_path)
+            else:
+                self._cleanup_export_temp_path()
+            self._close_progress()
+            self._export_request = None
+            return
+
+        if not isinstance(result, _ExportJobResult):
+            self._show_save_error(
+                RuntimeError("Export worker returned an invalid result.")
+            )
+            return
+
+        if result.illumination is not None:
+            self._full_illumination_cache_key = request.key
+            self._full_illumination_cache = result.illumination
+        try:
+            os.replace(result.temporary_path, request.path)
+        except Exception as exc:
+            _remove_export_file(result.temporary_path)
+            self._show_save_error(exc)
+            return
+
+        self._export_temp_path = None
+        self._close_progress()
+        self._export_request = None
+
+    def _show_progress(self, message: str) -> None:
+        if self._progress_window is None:
+            window = ctk.CTkToplevel(self)
+            window.title("AstroFlatAnalyzer")
+            window.geometry("320x120")
+            window.resizable(False, False)
+            window.transient(self)
+            window.protocol("WM_DELETE_WINDOW", lambda: None)
+
+            label = ctk.CTkLabel(window, text=message)
+            label.pack(fill="x", padx=20, pady=(20, 8))
+            progress = ctk.CTkProgressBar(window, mode="indeterminate")
+            progress.pack(fill="x", padx=20, pady=(0, 20))
+
+            self._progress_window = window
+            self._progress_label = label
+            self._progress_bar = progress
+            window.grab_set()
+        else:
+            self._set_progress_message(message)
+
+        if self._progress_bar is not None:
+            self._progress_bar.start()
+        if self._progress_window is not None:
+            self._progress_window.update_idletasks()
+
+    def _set_progress_message(self, message: str) -> None:
+        if self._progress_label is not None:
+            self._progress_label.configure(text=message)
+        if self._progress_window is not None:
+            self._progress_window.update_idletasks()
+
+    def _close_progress(self) -> None:
+        progress_bar = self.__dict__.get("_progress_bar")
+        progress_window = self.__dict__.get("_progress_window")
+        if progress_bar is not None:
+            progress_bar.stop()
+        if progress_window is not None:
+            try:
+                progress_window.grab_release()
+            except tk.TclError:
+                pass
+            progress_window.destroy()
+        self.__dict__["_progress_window"] = None
+        self.__dict__["_progress_label"] = None
+        self.__dict__["_progress_bar"] = None
+
+    def _show_save_error(self, exc: Exception) -> None:
+        self._cleanup_export_temp_path()
+        self._close_progress()
+        self._export_request = None
+        messagebox.showerror("Save error", str(exc))
+
+    def _on_close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        self._cancel_scheduled_preview()
+        if self._worker_poll_after is not None:
+            try:
+                self.after_cancel(self._worker_poll_after)
+            except tk.TclError:
+                pass
+            self._worker_poll_after = None
+        self._cleanup_export_temp_path()
+        self._close_progress()
+        self._export_request = None
+        preview_filter_executor = self.__dict__.get("_preview_filter_executor")
+        if preview_filter_executor is not None:
+            preview_filter_executor.shutdown(wait=False, cancel_futures=True)
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self.destroy()
 
 
 def run_app() -> None:

@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, gaussian_filter1d
 
 CORNER_REGION_SIZE = 50
 CENTER_REGION_FRACTION = 0.02
 FALLOFF_REGION_SIZE = 25
+_GAUSSIAN_TRUNCATE = 4.0
+_MIN_FILTER_PIXELS_PER_WORKER = 100_000
 
 
 class ReferenceMode(str, Enum):
@@ -218,10 +221,102 @@ def smooth_illumination(
     return smoothed
 
 
+def _filter_row_ranges(height: int, workers: int) -> list[tuple[int, int]]:
+    """Split image rows into contiguous, non-empty worker ranges."""
+    return [
+        (height * index // workers, height * (index + 1) // workers)
+        for index in range(workers)
+    ]
+
+
+def _effective_filter_workers(image: np.ndarray, requested: int) -> int:
+    """Bound filter parallelism by image size and available row ranges."""
+    if requested <= 1 or image.ndim != 2:
+        return 1
+
+    by_pixels = max(1, image.size // _MIN_FILTER_PIXELS_PER_WORKER)
+    return max(1, min(int(requested), image.shape[0], by_pixels))
+
+
+def _parallel_gaussian_filter(
+    image: np.ndarray,
+    sigma: float,
+    workers: int,
+    executor: Executor | None = None,
+) -> np.ndarray:
+    """Apply a Gaussian filter in independent row tiles.
+
+    SciPy's Gaussian filter is separable but does not expose a worker-count
+    argument. The vertical pass uses a radius-sized halo for each tile; the
+    horizontal pass is independent for each core tile. This preserves the
+    default reflect boundary behavior while allowing the two C-level filter
+    passes to run concurrently.
+    """
+    worker_count = _effective_filter_workers(image, workers)
+    if worker_count <= 1:
+        return gaussian_filter(
+            image,
+            sigma=sigma,
+            truncate=_GAUSSIAN_TRUNCATE,
+        )
+
+    radius = int(round(_GAUSSIAN_TRUNCATE * sigma))
+    ranges = _filter_row_ranges(image.shape[0], worker_count)
+
+    def vertical_pass(row_range: tuple[int, int]) -> tuple[int, int, np.ndarray]:
+        start, end = row_range
+        extended_start = max(0, start - radius)
+        extended_end = min(image.shape[0], end + radius)
+        extended = image[extended_start:extended_end]
+        filtered = gaussian_filter1d(
+            extended,
+            sigma=sigma,
+            axis=0,
+            mode="reflect",
+            truncate=_GAUSSIAN_TRUNCATE,
+        )
+        core_start = start - extended_start
+        core_end = end - extended_start
+        return start, end, filtered[core_start:core_end]
+
+    def run_filter(active_executor: Executor) -> np.ndarray:
+        vertical = np.empty_like(image, dtype=np.float64)
+        for start, end, filtered in active_executor.map(vertical_pass, ranges):
+            vertical[start:end] = filtered
+
+        def horizontal_pass(row_range: tuple[int, int]) -> tuple[int, int, np.ndarray]:
+            start, end = row_range
+            filtered = gaussian_filter1d(
+                vertical[start:end],
+                sigma=sigma,
+                axis=1,
+                mode="reflect",
+                truncate=_GAUSSIAN_TRUNCATE,
+            )
+            return start, end, filtered
+
+        result = np.empty_like(image, dtype=np.float64)
+        for start, end, filtered in active_executor.map(horizontal_pass, ranges):
+            result[start:end] = filtered
+        return result
+
+    if executor is not None:
+        return run_filter(executor)
+
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="preview-filter",
+    ) as active_executor:
+        return run_filter(active_executor)
+
+
 def compute_illumination_map(
     image: np.ndarray,
     mode: ReferenceMode = ReferenceMode.CENTER,
     sigma: float = 0,
+    *,
+    workers: int = 1,
+    executor: Executor | None = None,
 ) -> np.ndarray:
     """Smooth the raw flat, then normalize to illumination percentages.
 
@@ -230,7 +325,12 @@ def compute_illumination_map(
     """
     processed = image.astype(np.float64, copy=False)
     if sigma > 0:
-        processed = gaussian_filter(processed, sigma=sigma)
+        processed = _parallel_gaussian_filter(
+            processed,
+            sigma=sigma,
+            workers=workers,
+            executor=executor,
+        )
     return normalize_illumination(processed, mode)
 
 
@@ -319,7 +419,12 @@ def resample_for_export(
     export_width: int,
     export_height: int,
 ) -> np.ndarray:
-    """Resample illumination map to export dimensions using bilinear zoom."""
+    """Resample illumination map to export dimensions using bilinear zoom.
+
+    The preallocated output keeps the existing ``scipy.ndimage.zoom``
+    interpolation and coordinate mapping while avoiding its result copy.
+    Non-finite values retain the historical replacement-with-zero behavior.
+    """
     ny, nx = illumination_pct.shape
     if export_width == nx and export_height == ny:
         return illumination_pct.copy()
@@ -329,13 +434,26 @@ def resample_for_export(
 
     from scipy.ndimage import zoom
 
-    filled = np.nan_to_num(illumination_pct, nan=0.0)
-    resampled = zoom(filled, (zoom_y, zoom_x), order=1)
+    if np.isfinite(illumination_pct).all():
+        filled = illumination_pct
+    else:
+        filled = np.nan_to_num(illumination_pct, nan=0.0)
+
+    resampled = np.empty(
+        (export_height, export_width),
+        dtype=np.float64,
+    )
+    zoom(
+        filled,
+        (zoom_y, zoom_x),
+        output=resampled,
+        order=1,
+    )
 
     if resampled.shape != (export_height, export_width):
         resampled = resampled[:export_height, :export_width]
 
-    return resampled.astype(np.float64)
+    return resampled.astype(np.float64, copy=False)
 
 
 def reduce_for_preview(

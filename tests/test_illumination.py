@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from scipy.ndimage import zoom
 
 from flat_analyzer.illumination import (
     ReferenceMode,
@@ -61,6 +62,44 @@ def test_smoothing_sigma_zero_unchanged():
     assert np.allclose(mapped, raw)
 
 
+@pytest.mark.parametrize("workers", [1, 2, 4, 8])
+def test_parallel_gaussian_matches_serial_result(workers):
+    image = _make_vignetting((500, 800))
+    image[0, 0] = np.nan
+
+    serial = compute_illumination_map(
+        image,
+        ReferenceMode.CENTER,
+        sigma=9,
+        workers=1,
+    )
+    parallel = compute_illumination_map(
+        image,
+        ReferenceMode.CENTER,
+        sigma=9,
+        workers=workers,
+    )
+
+    assert np.allclose(parallel, serial, equal_nan=True, rtol=0, atol=1e-12)
+
+
+def test_parallel_gaussian_can_use_a_reusable_executor():
+    from concurrent.futures import ThreadPoolExecutor
+
+    image = _make_vignetting((500, 800))
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        result = compute_illumination_map(
+            image,
+            ReferenceMode.CENTER,
+            sigma=9,
+            workers=4,
+            executor=executor,
+        )
+    expected = compute_illumination_map(image, ReferenceMode.CENTER, sigma=9)
+
+    assert np.allclose(result, expected, equal_nan=True, rtol=0, atol=1e-12)
+
+
 def test_reduce_for_preview_uses_integer_area_averaging():
     image = np.arange(16, dtype=float).reshape(4, 4)
     reduced, factor = reduce_for_preview(image, max_dimension=2)
@@ -94,9 +133,9 @@ def test_reduce_for_preview_keeps_small_images_at_full_size():
     assert np.array_equal(reduced, image)
 
 
-@pytest.mark.parametrize("max_dimension", [512, 768, 900])
+@pytest.mark.parametrize("max_dimension", [1200, 1500, 1800])
 def test_reduced_preview_is_close_to_full_resolution_reference(max_dimension):
-    ny, nx = 600, 1200
+    ny, nx = 300, 2500
     y, x = np.mgrid[0:ny, 0:nx]
     image = _make_vignetting((ny, nx))
     image *= 1.0 + 0.05 * np.sin(x / 12.0) * np.sin(y / 17.0)
@@ -156,6 +195,32 @@ def test_resample_for_export_shape():
     raw = normalize_illumination(image, ReferenceMode.CENTER)
     out = resample_for_export(raw, 300, 200)
     assert out.shape == (200, 300)
+
+
+def test_resample_for_export_matches_zoom_for_odd_nonfinite_input():
+    image = np.arange(17 * 23, dtype=float).reshape(17, 23)
+    image[2, 3] = np.nan
+    image[8, 11] = np.inf
+    expected = zoom(
+        np.nan_to_num(image, nan=0.0),
+        (29 / 17, 31 / 23),
+        order=1,
+    )
+
+    actual = resample_for_export(image, 31, 29)
+
+    assert actual.shape == (29, 31)
+    assert np.array_equal(actual, expected)
+
+
+def test_resample_for_export_native_dimensions_return_an_independent_copy():
+    image = _make_vignetting((17, 23))
+
+    actual = resample_for_export(image, 23, 17)
+    actual[0, 0] = -1
+
+    assert actual.shape == image.shape
+    assert image[0, 0] != -1
 
 
 def test_compute_stats():

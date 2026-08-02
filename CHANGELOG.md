@@ -2,6 +2,26 @@
 
 All notable changes to AstroFlatAnalyzer are documented here.
 
+## [0.9.4] - 2026-08-02
+
+Enhancement release for responsive preview and full-resolution export
+generation.
+
+### Added
+
+- Bounded multithreaded Gaussian filtering for preview and full-resolution
+  illumination maps.
+- Background Agg rendering, encoding, and atomic generation-safe export saves.
+- Full-export benchmarks and regression coverage for numerical and raster
+  fidelity.
+
+### Changed
+
+- Export contour lines are twice as wide, with contour labels approximately
+  33% larger.
+- Export resampling reuses the existing interpolation path with preallocated
+  output storage.
+
 ## [0.9.3] - 2026-08-02
 
 Enhancement release for responsive controls and preview rendering.

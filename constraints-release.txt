@@ -1,4 +1,4 @@
-# Validated release-build dependency set for AstroFlatAnalyzer 0.9.3.
+# Validated release-build dependency set for AstroFlatAnalyzer 0.9.4.
 # Regenerate after intentionally upgrading dependencies and rerun the
 # complete cross-platform acceptance suite.
 astropy==8.0.1

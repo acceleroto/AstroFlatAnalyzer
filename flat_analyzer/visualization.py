@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 
 import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
 from flat_analyzer.illumination import effective_contour_levels
@@ -16,6 +18,9 @@ COLORMAP = "gray"
 EXPORT_DPI = 100
 CONTOUR_COLOR = "#00e5ff"
 CONTOUR_OUTLINE_COLOR = "#000000"
+MATPLOTLIB_RENDER_LOCK = RLock()
+EXPORT_CONTOUR_WIDTH_SCALE = 2.0
+EXPORT_LABEL_SCALE = 4.0 / 3.0
 
 
 @dataclass(frozen=True)
@@ -33,14 +38,14 @@ class RenderSettings:
 def _label_fontsize(nx: int, ny: int, for_export: bool) -> float:
     short_side = min(nx, ny)
     if for_export:
-        return max(32.0, short_side / 100.0)
+        return max(32.0, short_side / 100.0) * EXPORT_LABEL_SCALE
     return max(9.0, short_side / 120.0)
 
 
 def _contour_linewidth(nx: int, ny: int, for_export: bool, outline: bool = False) -> float:
     short_side = min(nx, ny)
     if for_export:
-        base = max(2.5, short_side / 1800.0)
+        base = max(2.5, short_side / 1800.0) * EXPORT_CONTOUR_WIDTH_SCALE
         return base * 2.2 if outline else base
     return 2.0 if outline else 1.0
 
@@ -202,17 +207,41 @@ def save_figure(
     path: str | Path,
     fmt: str = "png",
     jpg_quality: int = 95,
+    png_compress_level: int | None = None,
 ) -> None:
-    """Save figure to disk as PNG or JPEG."""
+    """Save a figure with an explicit noninteractive Agg canvas.
+
+    ``png_compress_level`` changes only lossless PNG compression work and is
+    left unset by default to retain Matplotlib/Pillow's existing behavior.
+    """
     path = Path(path)
-    if fmt.lower() in ("jpg", "jpeg"):
-        fig.savefig(
-            path,
-            format="jpeg",
-            dpi=EXPORT_DPI,
-            pad_inches=0,
-            pil_kwargs={"quality": jpg_quality},
-        )
-    else:
-        fig.savefig(path, format="png", dpi=EXPORT_DPI, pad_inches=0)
-    plt.close(fig)
+    if png_compress_level is not None and not 0 <= png_compress_level <= 9:
+        raise ValueError("PNG compression level must be between 0 and 9.")
+
+    with MATPLOTLIB_RENDER_LOCK:
+        FigureCanvasAgg(fig)
+        try:
+            if fmt.lower() in ("jpg", "jpeg"):
+                fig.savefig(
+                    path,
+                    format="jpeg",
+                    dpi=EXPORT_DPI,
+                    pad_inches=0,
+                    pil_kwargs={"quality": jpg_quality},
+                )
+            else:
+                pil_kwargs = (
+                    {"compress_level": png_compress_level}
+                    if png_compress_level is not None
+                    else None
+                )
+                fig.savefig(
+                    path,
+                    format="png",
+                    dpi=EXPORT_DPI,
+                    pad_inches=0,
+                    pil_kwargs=pil_kwargs,
+                )
+        finally:
+            fig.clear()
+            fig.set_canvas(None)
