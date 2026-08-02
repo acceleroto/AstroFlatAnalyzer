@@ -2,6 +2,15 @@
 
 All notable changes to AstroFlatAnalyzer are documented here.
 
+## [0.9.2] - 2026-08-01
+
+Patch release adding application branding.
+
+### Added
+
+- AstroFlatAnalyzer application icon for macOS, Windows, and Linux packaging.
+- Generated `.icns` and `.ico` platform assets from the supplied 1024×1024 PNG.
+
 ## [0.9.1] - 2026-08-01
 
 Patch release for standalone drag-and-drop support.
