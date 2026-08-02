@@ -6,6 +6,9 @@ FITS files are processed locally. The application does not upload images or requ
 
 Current release: **0.9.0 pre-release**
 
+- Repository: <https://github.com/Acceleroto/AstroFlatAnalyzer>
+- Downloads: <https://github.com/Acceleroto/AstroFlatAnalyzer/releases>
+
 ## Features
 
 - Load mono, Bayer, or already-debayered RGB FITS files (`.fits`, `.fit`, `.fts`)
