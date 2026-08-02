@@ -1,5 +1,6 @@
 # AstroFlatAnalyzer
 
+![AstroFlatAnalyzer screenshot](images/AstroFlatAnalyzer_screenshot01.png)
 AstroFlatAnalyzer analyzes illumination falloff and vignetting in astronomy flat calibration frames. It is a standalone desktop application for macOS, Windows, and Linux that produces a smoothed grayscale illumination map with optional topographic-style contour lines.
 
 FITS files are processed locally. The application does not upload images or require an internet connection after installation.
